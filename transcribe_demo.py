@@ -1,5 +1,3 @@
-#! python3.7
-
 import argparse
 import os
 import numpy as np
@@ -7,7 +5,7 @@ import speech_recognition as sr
 import whisper
 import torch
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from queue import Queue
 from time import sleep
 from sys import platform
@@ -15,35 +13,22 @@ from sys import platform
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="medium", help="Model to use",
-                        choices=["tiny", "base", "small", "medium", "large"])
-    parser.add_argument("--non_english", action='store_true',
-                        help="Don't use the english model.")
-    parser.add_argument("--energy_threshold", default=1000,
-                        help="Energy level for mic to detect.", type=int)
-    parser.add_argument("--record_timeout", default=2,
-                        help="How real time the recording is in seconds.", type=float)
-    parser.add_argument("--phrase_timeout", default=3,
-                        help="How much empty space between recordings before we "
-                             "consider it a new line in the transcription.", type=float)
+    # 引数を設定する部分
+    parser.add_argument("--model", default="medium", help="Model to use", choices=["tiny", "base", "small", "medium", "large"])
+    parser.add_argument("--non_english", action='store_true', help="Don't use the English model.")
+    parser.add_argument("--energy_threshold", default=1000, help="Energy level for mic to detect.", type=int)
+    parser.add_argument("--record_timeout", default=2, help="How real-time the recording is in seconds.", type=float)
+    parser.add_argument("--phrase_timeout", default=3, help="How much empty space between recordings before we consider it a new line in the transcription.", type=float)
     if 'linux' in platform:
-        parser.add_argument("--default_microphone", default='pulse',
-                            help="Default microphone name for SpeechRecognition. "
-                                 "Run this with 'list' to view available Microphones.", type=str)
-    args = parser.parse_args()
+        parser.add_argument("--default_microphone", default='pulse', help="Default microphone name for SpeechRecognition.", type=str)
+    
+    args = parser.parse_args()  # argsをパースして設定
 
-    # The last time a recording was retrieved from the queue.
-    phrase_time = None
-    # Thread safe Queue for passing data from the threaded recording callback.
-    data_queue = Queue()
-    # We use SpeechRecognizer to record our audio because it has a nice feature where it can detect when speech ends.
+    # その後の処理...
     recorder = sr.Recognizer()
-    recorder.energy_threshold = args.energy_threshold
-    # Definitely do this, dynamic energy compensation lowers the energy threshold dramatically to a point where the SpeechRecognizer never stops recording.
-    recorder.dynamic_energy_threshold = False
+    recorder.energy_threshold = args.energy_threshold  # ここでargsを使用
 
-    # Important for linux users.
-    # Prevents permanent application hang and crash by using the wrong Microphone
+    # Linuxの場合の設定...
     if 'linux' in platform:
         mic_name = args.default_microphone
         if not mic_name or mic_name == 'list':
@@ -59,45 +44,43 @@ def main():
     else:
         source = sr.Microphone(sample_rate=16000)
 
-    # Load / Download model
-    model = args.model
-    if args.model != "large" and not args.non_english:
-        model = model + ".en"
-    audio_model = whisper.load_model(model)
-
-    record_timeout = args.record_timeout
-    phrase_timeout = args.phrase_timeout
-
-    transcription = ['']
-
-    with source:
+    # 必ずwithブロック内でsourceを使用
+    with source as source:
         recorder.adjust_for_ambient_noise(source)
 
-    def record_callback(_, audio:sr.AudioData) -> None:
+    # 音声モデルのロード
+    audio_model = whisper.load_model(args.model)
+
+    # 音声データを保存するためのキュー
+    data_queue = Queue()
+
+    def record_callback(_, audio: sr.AudioData) -> None:
         """
         Threaded callback function to receive audio data when recordings finish.
         audio: An AudioData containing the recorded bytes.
         """
-        # Grab the raw bytes and push it into the thread safe queue.
+        # Grab the raw bytes and push it into the thread-safe queue.
         data = audio.get_raw_data()
         data_queue.put(data)
 
     # Create a background thread that will pass us raw audio bytes.
-    # We could do this manually but SpeechRecognizer provides a nice helper.
-    recorder.listen_in_background(source, record_callback, phrase_time_limit=record_timeout)
+    recorder.listen_in_background(source, record_callback, phrase_time_limit=args.record_timeout)
 
     # Cue the user that we're ready to go.
     print("Model loaded.\n")
 
+    transcription = []  # 初期化
+    phrase_time = None
+
     while True:
         try:
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)  # 修正
             # Pull raw recorded audio from the queue.
             if not data_queue.empty():
                 phrase_complete = False
                 # If enough time has passed between recordings, consider the phrase complete.
                 # Clear the current working audio buffer to start over with the new data.
-                if phrase_time and now - phrase_time > timedelta(seconds=phrase_timeout):
+                if phrase_time and now - phrase_time > timedelta(seconds=args.phrase_timeout):
                     phrase_complete = True
                 # This is the last time we received new audio data from the queue.
                 phrase_time = now
@@ -112,18 +95,20 @@ def main():
                 audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
 
                 # Read the transcription.
-                result = audio_model.transcribe(audio_np, fp16=torch.cuda.is_available())
+                # Read the transcription.
+                result = audio_model.transcribe(audio_np, fp16=torch.cuda.is_available(), language="en")
                 text = result['text'].strip()
+
 
                 # If we detected a pause between recordings, add a new item to our transcription.
                 # Otherwise edit the existing one.
                 if phrase_complete:
                     transcription.append(text)
-                else:
-                    transcription[-1] = text
+                elif transcription:
+                    transcription[-1] = text  # 修正：空でない場合に[-1]を更新
 
                 # Clear the console to reprint the updated transcription.
-                os.system('cls' if os.name=='nt' else 'clear')
+                os.system('cls' if os.name == 'nt' else 'clear')
                 for line in transcription:
                     print(line)
                 # Flush stdout.
